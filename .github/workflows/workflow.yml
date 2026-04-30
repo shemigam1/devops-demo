@@ -1,0 +1,126 @@
+name: Java CI/CD to AWS Elastic Beanstalk
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.ACCOUNT_ID }}
+  ECR_REPOSITORY: devops-demo-dreamdevs
+  IMAGE_TAG: ${{ github.run_number }}-${{ github.run_attempt }}
+  APPLICATION_NAME: devops-demo-dreamdevs
+  ENVIRONMENT_NAME: devops-demo-dreamdevs-env
+  S3_BUCKET: ${{ secrets.S3_BUCKET }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Build with Maven
+        run: mvn clean package -DskipTests
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+
+      - name: Generate and upload deployment bundle
+        run: |
+          cat > docker-compose.yml << 'EOF'
+          services:
+            app:
+              image: ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+              ports:
+                - "80:8080"
+          EOF
+          
+          echo "=== docker-compose.yml contents ==="
+          cat docker-compose.yml
+          
+          echo "=== checking yaml indentation ==="
+          cat -A docker-compose.yml
+          
+          zip deploy.zip docker-compose.yml
+          
+          echo "=== verifying zip contents ==="
+          unzip -p deploy.zip docker-compose.yml
+          
+          aws s3 cp deploy.zip s3://${{ env.S3_BUCKET }}/deploy-${{ env.IMAGE_TAG }}.zip
+          echo "=== uploaded to S3 ==="
+
+      - name: Create EB application version
+        run: |
+          aws elasticbeanstalk create-application-version \
+            --application-name $APPLICATION_NAME \
+            --version-label v-$IMAGE_TAG \
+            --source-bundle S3Bucket=$S3_BUCKET,S3Key=deploy-$IMAGE_TAG.zip \
+            --process
+
+      - name: Wait for version to be processed
+        run: |
+          for i in $(seq 1 20); do
+            RESULT=$(aws elasticbeanstalk describe-application-versions \
+              --application-name "$APPLICATION_NAME" \
+              --version-label "v-$IMAGE_TAG" \
+              --query 'ApplicationVersions[0]' \
+              --output json)
+
+            STATUS=$(echo $RESULT | python3 -c "import sys,json; print(json.load(sys.stdin)['Status'])")
+            DESCRIPTION=$(echo $RESULT | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Description','no description'))")
+
+            echo "Attempt $i — Status: $STATUS | Reason: $DESCRIPTION"
+
+            case $STATUS in
+              PROCESSED)   echo "Version ready"; exit 0 ;;
+              FAILED)      echo "Version failed: $DESCRIPTION"; exit 1 ;;
+              UNPROCESSED) echo "Deploying without pre-processing"; exit 0 ;;
+            esac
+            sleep 5
+          done
+          echo "Timeout"
+          exit 1
+
+
+      - name: Get version failure reason
+        if: failure()
+        run: |
+          aws elasticbeanstalk describe-application-versions \
+            --application-name "$APPLICATION_NAME" \
+            --version-label "v-$IMAGE_TAG" \
+            --output json    
+
+      - name: Deploy to Elastic Beanstalk
+        run: |
+          aws elasticbeanstalk update-environment \
+            --environment-name $ENVIRONMENT_NAME \
+            --version-label v-$IMAGE_TAG
+
+      - name: Wait for deployment
+        run: |
+          aws elasticbeanstalk wait environment-updated \
+            --environment-name $ENVIRONMENT_NAME
